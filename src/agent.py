@@ -156,16 +156,17 @@ def format_tool_use(tool_name: str, tool_input: dict) -> str:
     return f"{icon} **{tool_name}** {summary}"
 
 
-def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
+def parse_json_output(output: str) -> tuple[str, list[str], list[str], str | None]:
     """
-    Parse Claude Code JSON output to extract response, tool uses, and thinking.
+    Parse Claude Code JSON output to extract response, tool uses, thinking, and session ID.
 
     Returns:
-        Tuple of (final_response, tool_uses, thinking_blocks)
+        Tuple of (final_response, tool_uses, thinking_blocks, session_id)
     """
     tool_uses = []
     thinking_blocks = []
     final_response = ""
+    session_id = None
 
     try:
         # Try to parse as a single JSON object first
@@ -173,6 +174,24 @@ def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
 
         # Handle different JSON structures
         if isinstance(data, dict):
+            # Extract session ID (try various possible field names)
+            session_id = (
+                data.get("session_id") or
+                data.get("sessionId") or
+                data.get("session") or
+                data.get("conversation_id") or
+                data.get("conversationId") or
+                data.get("conversation") or
+                data.get("thread_id") or
+                data.get("threadId") or
+                data.get("id") or
+                data.get("uuid")
+            )
+
+            # Log the keys for debugging if no session ID found
+            if not session_id:
+                logger.debug(f"JSON keys available: {list(data.keys())}")
+
             # Check for result field
             if "result" in data:
                 final_response = data["result"]
@@ -229,6 +248,16 @@ def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
                 if isinstance(event, dict):
                     event_type = event.get("type", "")
 
+                    # Extract session ID from any event
+                    if not session_id:
+                        session_id = (
+                            event.get("session_id") or
+                            event.get("sessionId") or
+                            event.get("conversation_id") or
+                            event.get("conversationId") or
+                            event.get("id")
+                        )
+
                     # Tool use events
                     if event_type == "tool_use" or "tool" in event_type.lower():
                         tool_name = event.get("name", event.get("tool", "unknown"))
@@ -264,7 +293,7 @@ def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
     if not final_response:
         final_response = output
 
-    return final_response, tool_uses, thinking_blocks
+    return final_response, tool_uses, thinking_blocks, session_id
 
 
 class Agent:
@@ -332,19 +361,27 @@ class Agent:
             if result.stderr:
                 logger.warning(f"Claude Code stderr: {result.stderr}")
 
-            new_conversation_id = conversation_id
-
             if result.returncode != 0:
                 error_msg = result.stderr or "Unknown error"
                 return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", None, [], []
 
-            # Parse JSON output for transparency
-            response, tool_uses, thinking = parse_json_output(output)
+            # Log raw output for debugging (first 500 chars)
+            logger.debug(f"Raw Claude Code output: {output[:500]}...")
+
+            # Parse JSON output for transparency and session ID
+            response, tool_uses, thinking, new_session_id = parse_json_output(output)
+
+            # Use new session ID if found, otherwise keep existing
+            final_session_id = new_session_id or conversation_id
 
             # SECURITY: Redact any secrets
             response = redact_secrets(response.strip()) if response else "No output from Claude Code"
 
-            return response, new_conversation_id, tool_uses, thinking
+            logger.info(f"Session ID: {final_session_id}, Tools used: {len(tool_uses)}")
+            if not final_session_id:
+                logger.warning("No session ID found - conversation continuity may not work")
+
+            return response, final_session_id, tool_uses, thinking
 
         except subprocess.TimeoutExpired:
             return "Error: Claude Code timed out after 5 minutes", None, [], []
