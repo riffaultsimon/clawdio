@@ -2,6 +2,7 @@ import subprocess
 import logging
 import os
 import re
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +94,181 @@ def redact_secrets(text: str) -> str:
     return result
 
 
+def format_tool_use(tool_name: str, tool_input: dict) -> str:
+    """Format a tool use for display."""
+    # Identify MCP tools (they usually have a server prefix)
+    is_mcp = ":" in tool_name or tool_name.startswith("mcp_")
+
+    icon = ""
+    if is_mcp:
+        icon = "🔌"  # MCP tool
+    elif tool_name in ("Bash", "bash", "run_command"):
+        icon = "💻"
+    elif tool_name in ("Read", "read_file"):
+        icon = "📖"
+    elif tool_name in ("Write", "write_file"):
+        icon = "✏️"
+    elif tool_name in ("Edit", "edit_file"):
+        icon = "📝"
+    elif tool_name in ("Glob", "glob"):
+        icon = "🔍"
+    elif tool_name in ("Grep", "grep"):
+        icon = "🔎"
+    elif tool_name.lower().startswith("web") or "search" in tool_name.lower():
+        icon = "🌐"
+    else:
+        icon = "🔧"
+
+    # Format the input summary
+    summary = ""
+    if tool_name in ("Bash", "bash", "run_command"):
+        cmd = tool_input.get("command", "")
+        # Truncate long commands
+        if len(cmd) > 60:
+            cmd = cmd[:57] + "..."
+        summary = f"`{cmd}`"
+    elif tool_name in ("Read", "read_file"):
+        path = tool_input.get("path", tool_input.get("file_path", ""))
+        summary = f"`{path}`"
+    elif tool_name in ("Write", "write_file", "Edit", "edit_file"):
+        path = tool_input.get("path", tool_input.get("file_path", ""))
+        summary = f"`{path}`"
+    elif tool_name in ("Glob", "glob"):
+        pattern = tool_input.get("pattern", "")
+        summary = f"`{pattern}`"
+    elif tool_name in ("Grep", "grep"):
+        pattern = tool_input.get("pattern", "")
+        summary = f"`{pattern}`"
+    elif "query" in tool_input:
+        query = tool_input.get("query", "")
+        if len(query) > 50:
+            query = query[:47] + "..."
+        summary = f'"{query}"'
+    elif "url" in tool_input:
+        summary = tool_input.get("url", "")
+    else:
+        # Generic: show first key-value pair
+        for key, value in tool_input.items():
+            if isinstance(value, str) and len(value) < 50:
+                summary = f"{key}: {value}"
+                break
+
+    return f"{icon} **{tool_name}** {summary}"
+
+
+def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
+    """
+    Parse Claude Code JSON output to extract response, tool uses, and thinking.
+
+    Returns:
+        Tuple of (final_response, tool_uses, thinking_blocks)
+    """
+    tool_uses = []
+    thinking_blocks = []
+    final_response = ""
+
+    try:
+        # Try to parse as a single JSON object first
+        data = json.loads(output)
+
+        # Handle different JSON structures
+        if isinstance(data, dict):
+            # Check for result field
+            if "result" in data:
+                final_response = data["result"]
+            elif "response" in data:
+                final_response = data["response"]
+            elif "content" in data:
+                content = data["content"]
+                if isinstance(content, str):
+                    final_response = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                final_response += block.get("text", "")
+                            elif block.get("type") == "tool_use":
+                                tool_name = block.get("name", "unknown")
+                                tool_input = block.get("input", {})
+                                tool_uses.append(format_tool_use(tool_name, tool_input))
+                            elif block.get("type") == "thinking":
+                                thinking = block.get("thinking", "")
+                                if thinking:
+                                    # Truncate long thinking
+                                    if len(thinking) > 200:
+                                        thinking = thinking[:197] + "..."
+                                    thinking_blocks.append(thinking)
+
+            # Check for messages array
+            if "messages" in data:
+                for msg in data["messages"]:
+                    if isinstance(msg, dict):
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict):
+                                    if block.get("type") == "tool_use":
+                                        tool_name = block.get("name", "unknown")
+                                        tool_input = block.get("input", {})
+                                        tool_uses.append(format_tool_use(tool_name, tool_input))
+                                    elif block.get("type") == "thinking":
+                                        thinking = block.get("thinking", "")
+                                        if thinking and len(thinking) > 10:
+                                            if len(thinking) > 200:
+                                                thinking = thinking[:197] + "..."
+                                            thinking_blocks.append(thinking)
+
+    except json.JSONDecodeError:
+        # Try parsing as newline-delimited JSON (stream format)
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                if isinstance(event, dict):
+                    event_type = event.get("type", "")
+
+                    # Tool use events
+                    if event_type == "tool_use" or "tool" in event_type.lower():
+                        tool_name = event.get("name", event.get("tool", "unknown"))
+                        tool_input = event.get("input", event.get("args", {}))
+                        tool_uses.append(format_tool_use(tool_name, tool_input))
+
+                    # Thinking events
+                    elif event_type == "thinking" or "think" in event_type.lower():
+                        thinking = event.get("thinking", event.get("content", ""))
+                        if thinking and len(thinking) > 10:
+                            if len(thinking) > 200:
+                                thinking = thinking[:197] + "..."
+                            thinking_blocks.append(thinking)
+
+                    # Text/result events
+                    elif event_type in ("text", "result", "response", "message"):
+                        text = event.get("text", event.get("content", event.get("result", "")))
+                        if text:
+                            final_response += text
+
+                    # Content delta events (streaming)
+                    elif event_type == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            final_response += delta.get("text", "")
+
+            except json.JSONDecodeError:
+                # Not JSON, might be plain text
+                if not final_response:
+                    final_response = line
+
+    # If we still don't have a response, use the raw output
+    if not final_response:
+        final_response = output
+
+    return final_response, tool_uses, thinking_blocks
+
+
 class Agent:
-    def __init__(self, api_key: str = None, working_directory: str = None, skip_permissions: bool = True):
+    def __init__(self, api_key: str = None, working_directory: str = None, skip_permissions: bool = True, verbose: bool = True):
         """
         Initialize the Claude Code agent.
 
@@ -102,13 +276,15 @@ class Agent:
             api_key: Anthropic API key (optional, Claude Code can use its own config)
             working_directory: Directory to run Claude Code in (default: home directory)
             skip_permissions: Skip permission prompts for full system access (default: True)
+            verbose: Show tool usage and thinking in responses (default: True)
         """
         self.api_key = api_key
         self.working_directory = working_directory or os.path.expanduser("~")
         self.skip_permissions = skip_permissions
+        self.verbose = verbose
         self.conversations: dict[int, str] = {}  # user_id -> conversation_id
 
-    def _run_claude_code(self, prompt: str, conversation_id: str = None) -> tuple[str, str | None]:
+    def _run_claude_code(self, prompt: str, conversation_id: str = None) -> tuple[str, str | None, list[str], list[str]]:
         """
         Run Claude Code with the given prompt.
 
@@ -117,10 +293,10 @@ class Agent:
             conversation_id: Optional conversation ID to continue a session
 
         Returns:
-            Tuple of (response_text, new_conversation_id)
+            Tuple of (response_text, new_conversation_id, tool_uses, thinking_blocks)
         """
-        # Build the command
-        cmd = ["claude", "-p", prompt, "--output-format", "text"]
+        # Build the command - use JSON format for transparency
+        cmd = ["claude", "-p", prompt, "--output-format", "json"]
 
         # Add security system prompt
         cmd.extend(["--append-system-prompt", SECURITY_PROMPT])
@@ -146,8 +322,8 @@ class Agent:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                errors="replace",  # Replace undecodable chars instead of crashing
-                timeout=300,  # 5 minute timeout
+                errors="replace",
+                timeout=300,
                 cwd=self.working_directory,
                 env=env,
             )
@@ -156,26 +332,27 @@ class Agent:
             if result.stderr:
                 logger.warning(f"Claude Code stderr: {result.stderr}")
 
-            # Try to extract conversation ID from output for continuation
-            # Claude Code may output session info we can parse
-            new_conversation_id = conversation_id  # Keep existing if we can't find new one
+            new_conversation_id = conversation_id
 
             if result.returncode != 0:
                 error_msg = result.stderr or "Unknown error"
-                return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", None
+                return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", None, [], []
 
-            # SECURITY: Redact any secrets that might have leaked
-            output = redact_secrets(output.strip()) if output else "No output from Claude Code"
+            # Parse JSON output for transparency
+            response, tool_uses, thinking = parse_json_output(output)
 
-            return output, new_conversation_id
+            # SECURITY: Redact any secrets
+            response = redact_secrets(response.strip()) if response else "No output from Claude Code"
+
+            return response, new_conversation_id, tool_uses, thinking
 
         except subprocess.TimeoutExpired:
-            return "Error: Claude Code timed out after 5 minutes", None
+            return "Error: Claude Code timed out after 5 minutes", None, [], []
         except FileNotFoundError:
-            return "Error: Claude Code CLI not found. Make sure 'claude' is installed and in PATH.", None
+            return "Error: Claude Code CLI not found. Make sure 'claude' is installed and in PATH.", None, [], []
         except Exception as e:
             logger.exception(f"Error running Claude Code: {e}")
-            return f"Error running Claude Code: {str(e)}", None
+            return f"Error running Claude Code: {str(e)}", None, [], []
 
     def process_message(self, user_id: int, message: str) -> list[tuple[str | None, bytes | None]]:
         """
@@ -188,18 +365,43 @@ class Agent:
         Returns:
             List of (text, image_bytes) tuples to send back
         """
-        # Get existing conversation ID if any
         conversation_id = self.conversations.get(user_id)
 
-        # Run Claude Code
-        response, new_conversation_id = self._run_claude_code(message, conversation_id)
+        response, new_conversation_id, tool_uses, thinking = self._run_claude_code(message, conversation_id)
 
-        # Store conversation ID for continuation
         if new_conversation_id:
             self.conversations[user_id] = new_conversation_id
 
-        # Check if response contains any image references (screenshots)
-        # Claude Code might save screenshots to files
+        # Build the formatted response
+        parts = []
+
+        # Add thinking summary if verbose
+        if self.verbose and thinking:
+            parts.append("🧠 **Thinking:**")
+            for thought in thinking[:3]:  # Max 3 thinking blocks
+                parts.append(f"_{thought}_")
+            parts.append("")
+
+        # Add tool uses if verbose
+        if self.verbose and tool_uses:
+            parts.append("⚙️ **Actions:**")
+            for tool in tool_uses[:10]:  # Max 10 tools shown
+                parts.append(f"  • {tool}")
+            if len(tool_uses) > 10:
+                parts.append(f"  _...and {len(tool_uses) - 10} more_")
+            parts.append("")
+
+        # Add separator if we had transparency info
+        if parts:
+            parts.append("───────────────")
+            parts.append("")
+
+        # Add the main response
+        parts.append(response)
+
+        formatted_response = "\n".join(parts)
+
+        # Check for screenshots
         image_bytes = None
         image_match = re.search(r'screenshot[s]?\s+saved?\s+(?:to|at)\s+["\']?([^"\'>\s]+)', response or "", re.IGNORECASE)
         if image_match:
@@ -210,7 +412,7 @@ class Agent:
             except Exception as e:
                 logger.warning(f"Could not read screenshot at {image_path}: {e}")
 
-        return [(response, image_bytes)]
+        return [(formatted_response, image_bytes)]
 
     def clear_conversation(self, user_id: int) -> None:
         """Clear conversation history for a user."""
