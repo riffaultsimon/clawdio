@@ -8,16 +8,18 @@ logger = logging.getLogger(__name__)
 
 
 class Agent:
-    def __init__(self, api_key: str = None, working_directory: str = None):
+    def __init__(self, api_key: str = None, working_directory: str = None, skip_permissions: bool = True):
         """
         Initialize the Claude Code agent.
 
         Args:
             api_key: Anthropic API key (optional, Claude Code can use its own config)
             working_directory: Directory to run Claude Code in (default: home directory)
+            skip_permissions: Skip permission prompts for full system access (default: True)
         """
         self.api_key = api_key
         self.working_directory = working_directory or os.path.expanduser("~")
+        self.skip_permissions = skip_permissions
         self.conversations: dict[int, str] = {}  # user_id -> conversation_id
 
     def _run_claude_code(self, prompt: str, conversation_id: str = None) -> tuple[str, str | None]:
@@ -33,6 +35,10 @@ class Agent:
         """
         # Build the command
         cmd = ["claude", "-p", prompt, "--output-format", "text"]
+
+        # Skip permission prompts for full system access
+        if self.skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
 
         # Continue conversation if we have an ID
         if conversation_id:
