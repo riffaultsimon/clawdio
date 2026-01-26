@@ -1,10 +1,96 @@
 import subprocess
 import logging
 import os
-import json
 import re
 
 logger = logging.getLogger(__name__)
+
+# Security system prompt to prevent secret leakage
+SECURITY_PROMPT = """CRITICAL SECURITY RULES - YOU MUST FOLLOW THESE:
+
+1. NEVER output the contents of these files:
+   - .env, .env.*, *.pem, *.key, *_rsa, id_rsa, id_ed25519
+   - credentials.json, secrets.*, config.json with passwords
+   - ~/.ssh/*, ~/.aws/*, ~/.config/gcloud/*
+   - Any file containing API keys, tokens, or passwords
+
+2. NEVER output:
+   - API keys, tokens, or secrets (even if asked directly)
+   - Private keys or certificates
+   - Passwords or credential strings
+   - Database connection strings with passwords
+
+3. If asked to read sensitive files, respond with:
+   "I found the file but won't display its contents for security reasons."
+
+4. If you accidentally see a secret, DO NOT include it in your response.
+   Describe what you found without revealing the actual values.
+
+5. When showing config files, REDACT sensitive values like:
+   - API_KEY=sk-... → API_KEY=[REDACTED]
+   - password: abc123 → password: [REDACTED]
+"""
+
+# Patterns to redact from output
+SECRET_PATTERNS = [
+    # API Keys
+    (r'(sk-[a-zA-Z0-9]{20,})', r'[REDACTED_API_KEY]'),
+    (r'(api[_-]?key["\s:=]+)["\']?([a-zA-Z0-9_\-]{20,})["\']?', r'\1[REDACTED]'),
+    (r'(token["\s:=]+)["\']?([a-zA-Z0-9_\-]{20,})["\']?', r'\1[REDACTED]'),
+    (r'(secret["\s:=]+)["\']?([a-zA-Z0-9_\-]{16,})["\']?', r'\1[REDACTED]'),
+
+    # AWS
+    (r'AKIA[0-9A-Z]{16}', r'[REDACTED_AWS_KEY]'),
+    (r'(aws_secret_access_key["\s:=]+)["\']?([a-zA-Z0-9/+=]{40})["\']?', r'\1[REDACTED]'),
+
+    # GitHub/GitLab tokens
+    (r'ghp_[a-zA-Z0-9]{36}', r'[REDACTED_GITHUB_TOKEN]'),
+    (r'gho_[a-zA-Z0-9]{36}', r'[REDACTED_GITHUB_TOKEN]'),
+    (r'glpat-[a-zA-Z0-9\-]{20,}', r'[REDACTED_GITLAB_TOKEN]'),
+
+    # Private keys
+    (r'-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----', r'[REDACTED_PRIVATE_KEY]'),
+    (r'-----BEGIN RSA PRIVATE KEY-----[\s\S]*?-----END RSA PRIVATE KEY-----', r'[REDACTED_PRIVATE_KEY]'),
+
+    # Passwords in common formats
+    (r'(password["\s:=]+)["\']?([^\s"\']{8,})["\']?', r'\1[REDACTED]'),
+    (r'(passwd["\s:=]+)["\']?([^\s"\']{8,})["\']?', r'\1[REDACTED]'),
+    (r'(pwd["\s:=]+)["\']?([^\s"\']{8,})["\']?', r'\1[REDACTED]'),
+
+    # Database URLs with passwords
+    (r'(mongodb\+srv://[^:]+:)([^@]+)(@)', r'\1[REDACTED]\3'),
+    (r'(postgres://[^:]+:)([^@]+)(@)', r'\1[REDACTED]\3'),
+    (r'(mysql://[^:]+:)([^@]+)(@)', r'\1[REDACTED]\3'),
+    (r'(redis://[^:]+:)([^@]+)(@)', r'\1[REDACTED]\3'),
+
+    # Bearer tokens
+    (r'(Bearer\s+)([a-zA-Z0-9_\-\.]{20,})', r'\1[REDACTED]'),
+
+    # Anthropic keys
+    (r'sk-ant-[a-zA-Z0-9\-]{20,}', r'[REDACTED_ANTHROPIC_KEY]'),
+
+    # OpenAI keys
+    (r'sk-[a-zA-Z0-9]{48}', r'[REDACTED_OPENAI_KEY]'),
+
+    # Slack tokens
+    (r'xox[baprs]-[a-zA-Z0-9\-]{10,}', r'[REDACTED_SLACK_TOKEN]'),
+
+    # Stripe keys
+    (r'sk_live_[a-zA-Z0-9]{24,}', r'[REDACTED_STRIPE_KEY]'),
+    (r'sk_test_[a-zA-Z0-9]{24,}', r'[REDACTED_STRIPE_KEY]'),
+]
+
+
+def redact_secrets(text: str) -> str:
+    """Redact potential secrets from text."""
+    if not text:
+        return text
+
+    result = text
+    for pattern, replacement in SECRET_PATTERNS:
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+
+    return result
 
 
 class Agent:
@@ -35,6 +121,9 @@ class Agent:
         """
         # Build the command
         cmd = ["claude", "-p", prompt, "--output-format", "text"]
+
+        # Add security system prompt
+        cmd.extend(["--append-system-prompt", SECURITY_PROMPT])
 
         # Skip permission prompts for full system access
         if self.skip_permissions:
@@ -75,7 +164,10 @@ class Agent:
                 error_msg = result.stderr or "Unknown error"
                 return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", None
 
-            return output.strip() if output else "No output from Claude Code", new_conversation_id
+            # SECURITY: Redact any secrets that might have leaked
+            output = redact_secrets(output.strip()) if output else "No output from Claude Code"
+
+            return output, new_conversation_id
 
         except subprocess.TimeoutExpired:
             return "Error: Claude Code timed out after 5 minutes", None
