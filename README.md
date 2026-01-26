@@ -102,6 +102,46 @@ Open your Telegram bot and start chatting:
 
 Claude Code has full access to your system - it can read/write files, run shell commands, search code, and more.
 
+## Enabling Web Search (Optional)
+
+Claude Code doesn't have built-in web search. To add it, configure an MCP (Model Context Protocol) server.
+
+### Option 1: Brave Search
+
+1. Get a free API key at https://brave.com/search/api/ (2,000 queries/month free)
+
+2. Copy the example config to Claude Code's settings:
+   ```bash
+   cp claude-settings.json.example ~/.claude/settings.json
+   ```
+
+3. Edit `~/.claude/settings.json` and replace `your_brave_api_key_here` with your actual key
+
+4. Restart Clawdio
+
+### Option 2: Tavily Search
+
+1. Get a free API key at https://tavily.com/
+
+2. Create `~/.claude/settings.json`:
+   ```json
+   {
+     "mcpServers": {
+       "tavily": {
+         "command": "npx",
+         "args": ["-y", "tavily-mcp"],
+         "env": {
+           "TAVILY_API_KEY": "your_tavily_api_key"
+         }
+       }
+     }
+   }
+   ```
+
+3. Restart Clawdio
+
+Now you can ask Claude Code to search the web!
+
 ## Running as a Service (Optional)
 
 To keep Clawdio running in the background on macOS:
