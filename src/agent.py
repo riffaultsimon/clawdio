@@ -188,16 +188,17 @@ def extract_tools_recursive(obj, tool_uses: list, thinking_blocks: list):
             extract_tools_recursive(item, tool_uses, thinking_blocks)
 
 
-def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
+def parse_json_output(output: str) -> tuple[str, list[str], list[str], str | None]:
     """
-    Parse Claude Code JSON output to extract response, tool uses, and thinking.
+    Parse Claude Code JSON output to extract response, tool uses, thinking, and session ID.
 
     Returns:
-        Tuple of (final_response, tool_uses, thinking_blocks)
+        Tuple of (final_response, tool_uses, thinking_blocks, session_id)
     """
     tool_uses = []
     thinking_blocks = []
     final_response = ""
+    session_id = None
 
     try:
         data = json.loads(output)
@@ -205,6 +206,21 @@ def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
         # Log the top-level keys for debugging
         if isinstance(data, dict):
             logger.debug(f"JSON top-level keys: {list(data.keys())}")
+
+            # Extract session_id
+            session_id = data.get("session_id")
+
+            # Extract server tool usage from usage.server_tool_use
+            usage = data.get("usage", {})
+            server_tool_use = usage.get("server_tool_use", {})
+
+            web_search = server_tool_use.get("web_search_requests", 0)
+            web_fetch = server_tool_use.get("web_fetch_requests", 0)
+
+            if web_search > 0:
+                tool_uses.append(f"🌐 **Web Search** ({web_search} request{'s' if web_search > 1 else ''})")
+            if web_fetch > 0:
+                tool_uses.append(f"📄 **Web Fetch** ({web_fetch} request{'s' if web_fetch > 1 else ''})")
 
         # Recursively extract tools and thinking from entire structure
         extract_tools_recursive(data, tool_uses, thinking_blocks)
@@ -291,7 +307,7 @@ def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
     if not final_response:
         final_response = output
 
-    return final_response, tool_uses, thinking_blocks
+    return final_response, tool_uses, thinking_blocks, session_id
 
 
 @dataclass
@@ -358,6 +374,7 @@ class Agent:
         self.skip_permissions = skip_permissions
         self.verbose = verbose
         self.conversations: dict[int, Conversation] = {}
+        self.session_ids: dict[int, str] = {}  # user_id -> Claude Code session_id
 
     def _get_conversation(self, user_id: int) -> Conversation:
         """Get or create conversation for a user."""
@@ -365,25 +382,24 @@ class Agent:
             self.conversations[user_id] = Conversation()
         return self.conversations[user_id]
 
-    def _run_claude_code(self, prompt: str, context: str = "") -> tuple[str, list[str], list[str]]:
+    def _run_claude_code(self, prompt: str, session_id: str = None) -> tuple[str, list[str], list[str], str | None]:
         """
         Run Claude Code with the given prompt.
 
         Args:
             prompt: The user's message/prompt
-            context: Previous conversation context
+            session_id: Optional session ID to continue conversation
 
         Returns:
-            Tuple of (response_text, tool_uses, thinking_blocks)
+            Tuple of (response_text, tool_uses, thinking_blocks, new_session_id)
         """
-        # Build the full prompt with context
-        if context:
-            full_prompt = f"{context}\n\nCurrent request: {prompt}"
-        else:
-            full_prompt = prompt
-
         # Build the command
-        cmd = ["claude", "-p", full_prompt, "--output-format", "json"]
+        cmd = ["claude", "-p", prompt, "--output-format", "json"]
+
+        # Continue existing session if we have one
+        if session_id:
+            cmd.extend(["--continue", session_id])
+            logger.info(f"Continuing session: {session_id[:8]}...")
 
         # Add security system prompt
         cmd.extend(["--append-system-prompt", SECURITY_PROMPT])
@@ -397,7 +413,7 @@ class Agent:
         if self.api_key:
             env["ANTHROPIC_API_KEY"] = self.api_key
 
-        logger.info(f"Running Claude Code with context: {len(context)} chars")
+        logger.info(f"Running Claude Code...")
 
         try:
             result = subprocess.run(
@@ -417,28 +433,28 @@ class Agent:
 
             if result.returncode != 0:
                 error_msg = result.stderr or "Unknown error"
-                return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", [], []
+                return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", [], [], None
 
             # Log first part of raw output for debugging
             logger.debug(f"Raw output (first 1000 chars): {output[:1000]}")
 
-            # Parse JSON output for transparency
-            response, tool_uses, thinking = parse_json_output(output)
+            # Parse JSON output for transparency and session ID
+            response, tool_uses, thinking, new_session_id = parse_json_output(output)
 
             # SECURITY: Redact any secrets
             response = redact_secrets(response.strip()) if response else "No output from Claude Code"
 
-            logger.info(f"Response length: {len(response)}, Tools used: {len(tool_uses)}")
+            logger.info(f"Response length: {len(response)}, Tools used: {len(tool_uses)}, Session: {new_session_id[:8] if new_session_id else 'None'}...")
 
-            return response, tool_uses, thinking
+            return response, tool_uses, thinking, new_session_id
 
         except subprocess.TimeoutExpired:
-            return "Error: Claude Code timed out after 5 minutes", [], []
+            return "Error: Claude Code timed out after 5 minutes", [], [], None
         except FileNotFoundError:
-            return "Error: Claude Code CLI not found. Make sure 'claude' is installed and in PATH.", [], []
+            return "Error: Claude Code CLI not found. Make sure 'claude' is installed and in PATH.", [], [], None
         except Exception as e:
             logger.exception(f"Error running Claude Code: {e}")
-            return f"Error running Claude Code: {str(e)}", [], []
+            return f"Error running Claude Code: {str(e)}", [], [], None
 
     def process_message(self, user_id: int, message: str) -> list[tuple[str | None, bytes | None]]:
         """
@@ -451,19 +467,15 @@ class Agent:
         Returns:
             List of (text, image_bytes) tuples to send back
         """
-        # Get conversation and context
-        conversation = self._get_conversation(user_id)
-        context = conversation.get_context()
+        # Get existing session ID for this user
+        session_id = self.session_ids.get(user_id)
 
-        # Add user message to history
-        conversation.add_user_message(message)
+        # Run Claude Code with session continuation
+        response, tool_uses, thinking, new_session_id = self._run_claude_code(message, session_id)
 
-        # Run Claude Code with context
-        response, tool_uses, thinking = self._run_claude_code(message, context)
-
-        # Add assistant response to history (truncate for storage)
-        response_for_history = response[:1000] if len(response) > 1000 else response
-        conversation.add_assistant_message(response_for_history)
+        # Store new session ID for future messages
+        if new_session_id:
+            self.session_ids[user_id] = new_session_id
 
         # Build the formatted response
         parts = []
@@ -511,3 +523,6 @@ class Agent:
         """Clear conversation history for a user."""
         if user_id in self.conversations:
             self.conversations[user_id].clear()
+        if user_id in self.session_ids:
+            del self.session_ids[user_id]
+            logger.info(f"Cleared session for user {user_id}")
