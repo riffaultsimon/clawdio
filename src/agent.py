@@ -154,6 +154,40 @@ def format_tool_use(tool_name: str, tool_input: dict) -> str:
     return f"{icon} **{tool_name}** {summary}"
 
 
+def extract_tools_recursive(obj, tool_uses: list, thinking_blocks: list):
+    """Recursively extract tool uses and thinking from nested structures."""
+    if isinstance(obj, dict):
+        obj_type = obj.get("type", "")
+
+        # Check for tool_use type
+        if obj_type == "tool_use" or obj_type == "tool_call":
+            tool_name = obj.get("name", obj.get("tool", obj.get("function", {}).get("name", "unknown")))
+            tool_input = obj.get("input", obj.get("args", obj.get("arguments", obj.get("function", {}).get("arguments", {}))))
+            if isinstance(tool_input, str):
+                try:
+                    tool_input = json.loads(tool_input)
+                except:
+                    tool_input = {"raw": tool_input}
+            tool_uses.append(format_tool_use(tool_name, tool_input))
+
+        # Check for thinking type
+        elif obj_type == "thinking":
+            thinking = obj.get("thinking", obj.get("content", ""))
+            if thinking and len(thinking) > 10:
+                if len(thinking) > 200:
+                    thinking = thinking[:197] + "..."
+                thinking_blocks.append(thinking)
+
+        # Recurse into all values
+        for key, value in obj.items():
+            if key in ("tool_calls", "tools", "tool_use", "messages", "content", "blocks"):
+                extract_tools_recursive(value, tool_uses, thinking_blocks)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_tools_recursive(item, tool_uses, thinking_blocks)
+
+
 def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
     """
     Parse Claude Code JSON output to extract response, tool uses, and thinking.
@@ -167,6 +201,13 @@ def parse_json_output(output: str) -> tuple[str, list[str], list[str]]:
 
     try:
         data = json.loads(output)
+
+        # Log the top-level keys for debugging
+        if isinstance(data, dict):
+            logger.debug(f"JSON top-level keys: {list(data.keys())}")
+
+        # Recursively extract tools and thinking from entire structure
+        extract_tools_recursive(data, tool_uses, thinking_blocks)
 
         if isinstance(data, dict):
             if "result" in data:
@@ -377,6 +418,9 @@ class Agent:
             if result.returncode != 0:
                 error_msg = result.stderr or "Unknown error"
                 return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", [], []
+
+            # Log first part of raw output for debugging
+            logger.debug(f"Raw output (first 1000 chars): {output[:1000]}")
 
             # Parse JSON output for transparency
             response, tool_uses, thinking = parse_json_output(output)
