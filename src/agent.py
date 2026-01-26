@@ -56,12 +56,14 @@ class Agent:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",  # Replace undecodable chars instead of crashing
                 timeout=300,  # 5 minute timeout
                 cwd=self.working_directory,
                 env=env,
             )
 
-            output = result.stdout
+            output = result.stdout or ""
             if result.stderr:
                 logger.warning(f"Claude Code stderr: {result.stderr}")
 
@@ -73,7 +75,7 @@ class Agent:
                 error_msg = result.stderr or "Unknown error"
                 return f"Error running Claude Code (exit code {result.returncode}):\n{error_msg}", None
 
-            return output.strip(), new_conversation_id
+            return output.strip() if output else "No output from Claude Code", new_conversation_id
 
         except subprocess.TimeoutExpired:
             return "Error: Claude Code timed out after 5 minutes", None
@@ -107,7 +109,7 @@ class Agent:
         # Check if response contains any image references (screenshots)
         # Claude Code might save screenshots to files
         image_bytes = None
-        image_match = re.search(r'screenshot[s]?\s+saved?\s+(?:to|at)\s+["\']?([^"\'>\s]+)', response, re.IGNORECASE)
+        image_match = re.search(r'screenshot[s]?\s+saved?\s+(?:to|at)\s+["\']?([^"\'>\s]+)', response or "", re.IGNORECASE)
         if image_match:
             image_path = image_match.group(1)
             try:
