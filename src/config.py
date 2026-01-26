@@ -11,6 +11,10 @@ def get_config():
     allowed_users = os.getenv("ALLOWED_USER_IDS", "")
     working_directory = os.getenv("WORKING_DIRECTORY")
 
+    # Ollama settings
+    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+
     if not telegram_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
@@ -29,4 +33,6 @@ def get_config():
         "anthropic_key": anthropic_key,  # Can be None
         "allowed_user_ids": allowed_user_ids,
         "working_directory": working_directory,
+        "ollama_url": ollama_url,
+        "ollama_model": ollama_model,
     }

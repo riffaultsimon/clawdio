@@ -102,6 +102,51 @@ Open your Telegram bot and start chatting:
 
 Claude Code has full access to your system - it can read/write files, run shell commands, search code, and more.
 
+### Ollama Commands (Local LLMs)
+
+For simpler tasks, you can use local models via Ollama:
+
+- `/ollama <message>` - Chat with the local model
+- `/ollama_models` - List available models
+- `/ollama_model <name>` - Switch to a different model
+- `/ollama_clear` - Clear Ollama conversation
+
+## Using Ollama (Optional)
+
+Run local LLMs for tasks that don't need Claude Code's full capabilities.
+
+### 1. Install Ollama
+
+```bash
+# macOS
+brew install ollama
+
+# Or download from https://ollama.com
+```
+
+### 2. Pull a Model
+
+```bash
+ollama pull llama3.2
+# Or other models: mistral, codellama, phi3, etc.
+```
+
+### 3. Start Ollama
+
+```bash
+ollama serve
+```
+
+### 4. Configure (Optional)
+
+In `.env`:
+```env
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2
+```
+
+Now use `/ollama What is the capital of France?` in Telegram!
+
 ## Enabling Web Search (Optional)
 
 Claude Code doesn't have built-in web search. To add it, configure an MCP (Model Context Protocol) server.

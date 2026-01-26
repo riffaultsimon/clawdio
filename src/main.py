@@ -3,6 +3,7 @@ import sys
 
 from .config import get_config
 from .agent import Agent
+from .ollama_agent import OllamaAgent
 from .telegram_bot import TelegramBot
 
 # Configure logging
@@ -33,11 +34,19 @@ def main():
         )
         logger.info(f"Claude Code agent initialized (working dir: {agent.working_directory})")
 
+        # Initialize Ollama agent
+        ollama_agent = OllamaAgent(
+            base_url=config["ollama_url"],
+            model=config["ollama_model"],
+        )
+        logger.info(f"Ollama agent initialized (model: {ollama_agent.model})")
+
         # Initialize and run the Telegram bot
         bot = TelegramBot(
             token=config["telegram_token"],
             agent=agent,
             allowed_user_ids=config["allowed_user_ids"],
+            ollama_agent=ollama_agent,
         )
 
         # Run the bot (this blocks until stopped)
