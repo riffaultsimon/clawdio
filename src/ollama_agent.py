@@ -6,13 +6,13 @@ logger = logging.getLogger(__name__)
 
 
 class OllamaAgent:
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama3.2"):
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "gemma3:1b"):
         """
         Initialize the Ollama agent.
 
         Args:
             base_url: Ollama API URL (default: http://localhost:11434)
-            model: Model to use (default: llama3.2)
+            model: Model to use (default: gemma3:1b)
         """
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -99,7 +99,7 @@ class OllamaAgent:
                 data = response.json()
                 models = data.get("models", [])
                 if not models:
-                    return "No models found. Pull a model with: ollama pull llama3.2"
+                    return "No models found. Pull a model with: ollama pull gemma3:1b"
                 model_names = [m.get("name", "unknown") for m in models]
                 return "Available models:\n" + "\n".join(f"- {name}" for name in model_names)
 

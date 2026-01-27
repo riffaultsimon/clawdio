@@ -104,16 +104,17 @@ Claude Code has full access to your system - it can read/write files, run shell 
 
 ### Ollama Commands (Local LLMs)
 
-For simpler tasks, you can use local models via Ollama:
+For simpler tasks, you can use local models via Ollama. Conversations are maintained per user, so the model remembers context across messages until you clear it.
 
-- `/ollama <message>` - Chat with the local model
+- `/ollama <message>` - Chat with the local model (maintains conversation history)
+- `/ollama_mode` - Toggle Ollama as default (all messages go to Ollama instead of Claude)
 - `/ollama_models` - List available models
 - `/ollama_model <name>` - Switch to a different model
-- `/ollama_clear` - Clear Ollama conversation
+- `/ollama_clear` - Clear Ollama conversation history
 
 ## Using Ollama (Optional)
 
-Run local LLMs for tasks that don't need Claude Code's full capabilities.
+Run local LLMs for tasks that don't need Claude Code's full capabilities. Ollama conversations maintain context per user (up to 20 messages), so you can have back-and-forth discussions without repeating yourself.
 
 ### 1. Install Ollama
 
@@ -127,8 +128,8 @@ brew install ollama
 ### 2. Pull a Model
 
 ```bash
-ollama pull llama3.2
-# Or other models: mistral, codellama, phi3, etc.
+ollama pull gemma3:1b
+# Or other models: llama3.2, mistral, codellama, phi3, etc.
 ```
 
 ### 3. Start Ollama
@@ -142,10 +143,24 @@ ollama serve
 In `.env`:
 ```env
 OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=llama3.2
+OLLAMA_MODEL=gemma3:1b
 ```
 
 Now use `/ollama What is the capital of France?` in Telegram!
+
+Example multi-turn conversation:
+```
+You: /ollama What is the capital of France?
+Bot: The capital of France is Paris.
+
+You: /ollama What's its population?
+Bot: Paris has a population of about 2.1 million...
+
+You: /ollama_clear
+Bot: Ollama conversation cleared.
+```
+
+**Ollama Mode**: Use `/ollama_mode` to make Ollama the default - all your messages will go to Ollama without needing the `/ollama` prefix. Toggle it again to switch back to Claude Code.
 
 ## Enabling Web Search (Optional)
 
