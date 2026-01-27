@@ -1,5 +1,7 @@
 import io
+import time
 import logging
+import asyncio
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -13,6 +15,9 @@ from .agent import Agent
 from .ollama_agent import OllamaAgent
 
 logger = logging.getLogger(__name__)
+
+# Minimum time between message edits (Telegram rate limiting)
+MIN_EDIT_INTERVAL = 2.0  # seconds
 
 
 class TelegramBot:
@@ -28,6 +33,7 @@ class TelegramBot:
         self.ollama_agent = ollama_agent
         self.allowed_user_ids = allowed_user_ids
         self.application = None
+        self.ollama_mode_users: set[int] = set()  # Users with Ollama mode enabled
 
     def _is_authorized(self, user_id: int) -> bool:
         """Check if a user is authorized to use the bot."""
@@ -53,6 +59,7 @@ class TelegramBot:
             ollama_status = (
                 f"\n\nOllama Commands:\n"
                 f"/ollama <msg> - Chat with {self.ollama_agent.model}\n"
+                f"/ollama_mode - Toggle Ollama as default\n"
                 f"/ollama_models - List models\n"
                 f"/ollama_model <name> - Switch model\n"
                 f"/ollama_clear - Clear Ollama chat"
@@ -228,10 +235,71 @@ class TelegramBot:
         self.ollama_agent.clear_conversation(user_id)
         await update.message.reply_text("Ollama conversation cleared!")
 
+    async def ollama_mode_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /ollama_mode command to toggle Ollama as default."""
+        user_id = update.effective_user.id
+
+        if not self._is_authorized(user_id):
+            return
+
+        if not self.ollama_agent:
+            await update.message.reply_text("Ollama is not configured.")
+            return
+
+        if user_id in self.ollama_mode_users:
+            self.ollama_mode_users.discard(user_id)
+            await update.message.reply_text(
+                "🔵 **Ollama mode OFF**\n\n"
+                "Messages now go to Claude Code.\n"
+                "Use `/ollama <msg>` for single Ollama queries."
+            )
+        else:
+            self.ollama_mode_users.add(user_id)
+            await update.message.reply_text(
+                f"🟢 **Ollama mode ON** ({self.ollama_agent.model})\n\n"
+                "All messages now go to Ollama.\n"
+                "Use `/ollama_mode` again to switch back to Claude."
+            )
+
     # ============ Main Message Handler ============
 
+    async def _handle_ollama_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str) -> None:
+        """Handle a message routed to Ollama."""
+        user_id = update.effective_user.id
+        logger.info(f"Ollama mode message from user {user_id}: {message_text[:100]}...")
+
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action="typing"
+        )
+
+        processing_msg = await update.message.reply_text(
+            f"⏳ Processing with Ollama ({self.ollama_agent.model})..."
+        )
+
+        try:
+            response = self.ollama_agent.process_message(user_id, message_text)
+            await processing_msg.delete()
+
+            # Send response, splitting if too long
+            max_length = 4096
+            if len(response) <= max_length:
+                await update.message.reply_text(response)
+            else:
+                for i in range(0, len(response), max_length):
+                    chunk = response[i:i + max_length]
+                    await update.message.reply_text(chunk)
+
+        except Exception as e:
+            logger.exception(f"Error processing Ollama message: {e}")
+            try:
+                await processing_msg.delete()
+            except:
+                pass
+            await update.message.reply_text(f"Ollama error:\n{str(e)}")
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming text messages (routes to Claude Code)."""
+        """Handle incoming text messages (routes to Claude Code or Ollama based on mode)."""
         user_id = update.effective_user.id
         message_text = update.message.text
 
@@ -243,6 +311,11 @@ class TelegramBot:
             )
             return
 
+        # Check if user is in Ollama mode
+        if user_id in self.ollama_mode_users and self.ollama_agent:
+            await self._handle_ollama_message(update, context, message_text)
+            return
+
         logger.info(f"Message from user {user_id}: {message_text[:100]}...")
 
         await context.bot.send_chat_action(
@@ -250,12 +323,121 @@ class TelegramBot:
             action="typing"
         )
 
-        processing_msg = await update.message.reply_text("Processing with Claude Code...")
+        # Create the status message
+        status_msg = await update.message.reply_text("⏳ Starting Claude Code...")
+
+        # State for tracking progress
+        state = {
+            "current_tool": None,
+            "tool_count": 0,
+            "tools_list": [],
+            "thinking": False,
+            "has_text": False,
+            "last_edit": 0,
+            "pending_update": False,
+        }
+
+        async def update_status_message():
+            """Update the status message with current state."""
+            now = time.time()
+
+            # Rate limit edits
+            if now - state["last_edit"] < MIN_EDIT_INTERVAL:
+                state["pending_update"] = True
+                return
+
+            try:
+                lines = ["⏳ **Claude is working...**", ""]
+
+                # Show current action
+                if state["current_tool"]:
+                    lines.append(f"🔄 **Current:** {state['current_tool']}")
+                    lines.append("")
+
+                # Show recent tools (last 5)
+                if state["tools_list"]:
+                    lines.append("⚙️ **Actions:**")
+                    recent_tools = state["tools_list"][-5:]
+                    for tool in recent_tools:
+                        lines.append(f"  ✓ {tool}")
+                    if len(state["tools_list"]) > 5:
+                        lines.append(f"  _...and {len(state['tools_list']) - 5} more_")
+                    lines.append("")
+
+                # Show status
+                status_parts = []
+                if state["tool_count"] > 0:
+                    status_parts.append(f"{state['tool_count']} tools")
+                if state["thinking"]:
+                    status_parts.append("🧠 thinking")
+                if state["has_text"]:
+                    status_parts.append("✍️ writing")
+
+                if status_parts:
+                    lines.append(f"📊 {' | '.join(status_parts)}")
+
+                new_text = "\n".join(lines)
+
+                # Only edit if content changed (avoid unnecessary API calls)
+                await status_msg.edit_text(new_text)
+                state["last_edit"] = now
+                state["pending_update"] = False
+
+            except Exception as e:
+                logger.debug(f"Could not update status message: {e}")
+
+        async def on_event(event: dict):
+            """Handle streaming events from Claude Code."""
+            event_type = event.get("type", "")
+
+            if event_type == "tool_use":
+                state["current_tool"] = event.get("formatted", "Unknown tool")
+                state["tool_count"] += 1
+                state["tools_list"].append(event.get("formatted", "Unknown"))
+                await update_status_message()
+
+                # Send typing action to keep indicator alive
+                try:
+                    await context.bot.send_chat_action(
+                        chat_id=update.effective_chat.id,
+                        action="typing"
+                    )
+                except:
+                    pass
+
+            elif event_type == "tool_result":
+                state["current_tool"] = None
+                await update_status_message()
+
+            elif event_type == "thinking":
+                state["thinking"] = True
+                await update_status_message()
+
+            elif event_type == "text":
+                state["has_text"] = True
+                state["current_tool"] = None
+                if not state["has_text"]:
+                    await update_status_message()
+
+            elif event_type == "complete":
+                # Final update before completion
+                if state["pending_update"]:
+                    state["last_edit"] = 0  # Force update
+                    await update_status_message()
 
         try:
-            responses = self.agent.process_message(user_id, message_text)
-            await processing_msg.delete()
+            # Process with streaming
+            responses = await self.agent.process_message_streaming(
+                user_id, message_text, on_event
+            )
 
+            # Delete status message
+            try:
+                await status_msg.delete()
+            except:
+                pass
+
+            # Send final responses
             for text, image in responses:
                 if image is not None:
                     await update.message.reply_photo(
@@ -274,7 +456,7 @@ class TelegramBot:
         except Exception as e:
             logger.exception(f"Error processing message: {e}")
             try:
-                await processing_msg.delete()
+                await status_msg.delete()
             except:
                 pass
             await update.message.reply_text(f"Sorry, an error occurred:\n{str(e)}")
@@ -292,6 +474,7 @@ class TelegramBot:
 
         # Ollama handlers
         self.application.add_handler(CommandHandler("ollama", self.ollama_command))
+        self.application.add_handler(CommandHandler("ollama_mode", self.ollama_mode_command))
         self.application.add_handler(CommandHandler("ollama_models", self.ollama_models_command))
         self.application.add_handler(CommandHandler("ollama_model", self.ollama_model_command))
         self.application.add_handler(CommandHandler("ollama_clear", self.ollama_clear_command))

@@ -13,7 +13,7 @@ def get_config():
 
     # Ollama settings
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+    ollama_model = os.getenv("OLLAMA_MODEL", "gemma3:1b")
 
     if not telegram_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")

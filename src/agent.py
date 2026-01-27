@@ -1,10 +1,12 @@
 import subprocess
+import asyncio
 import logging
 import os
 import re
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import AsyncGenerator, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +458,203 @@ class Agent:
             logger.exception(f"Error running Claude Code: {e}")
             return f"Error running Claude Code: {str(e)}", [], [], None
 
+    async def run_claude_code_streaming(
+        self,
+        prompt: str,
+        session_id: str = None,
+        on_event: Callable[[dict], Awaitable[None]] = None
+    ) -> tuple[str, list[str], list[str], str | None]:
+        """
+        Run Claude Code with streaming output, calling on_event for each event.
+
+        Args:
+            prompt: The user's message/prompt
+            session_id: Optional session ID to continue conversation
+            on_event: Async callback called for each streaming event
+
+        Returns:
+            Tuple of (response_text, tool_uses, thinking_blocks, new_session_id)
+        """
+        # Build the command with stream-json format (requires --verbose with -p)
+        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+
+        # Continue existing session if we have one
+        if session_id:
+            cmd.extend(["--continue", session_id])
+            logger.info(f"Continuing session: {session_id[:8]}...")
+
+        # Add security system prompt
+        cmd.extend(["--append-system-prompt", SECURITY_PROMPT])
+
+        # Skip permission prompts for full system access
+        if self.skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
+
+        # Set up environment
+        env = os.environ.copy()
+        if self.api_key:
+            env["ANTHROPIC_API_KEY"] = self.api_key
+
+        logger.info(f"Running Claude Code (streaming)...")
+
+        tool_uses = []
+        thinking_blocks = []
+        text_parts = []
+        new_session_id = None
+
+        try:
+            # Use Popen for streaming
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.working_directory,
+                env=env,
+            )
+
+            # Read stdout line by line
+            while True:
+                line = await asyncio.wait_for(
+                    process.stdout.readline(),
+                    timeout=300  # 5 minute timeout
+                )
+
+                if not line:
+                    break
+
+                line_str = line.decode("utf-8", errors="replace").strip()
+                if not line_str:
+                    continue
+
+                try:
+                    event = json.loads(line_str)
+
+                    # Extract session_id from any event that has it
+                    if isinstance(event, dict):
+                        if "session_id" in event:
+                            new_session_id = event["session_id"]
+
+                        event_type = event.get("type", "")
+
+                        # Handle different event types
+                        if event_type == "system":
+                            # System events (init, etc.)
+                            if on_event:
+                                await on_event({
+                                    "type": "system",
+                                    "subtype": event.get("subtype", ""),
+                                    "message": event.get("message", "")
+                                })
+
+                        elif event_type == "assistant":
+                            # Assistant message with content
+                            message = event.get("message", {})
+                            content = message.get("content", [])
+
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, dict):
+                                        block_type = block.get("type", "")
+
+                                        if block_type == "tool_use":
+                                            tool_name = block.get("name", "unknown")
+                                            tool_input = block.get("input", {})
+                                            formatted = format_tool_use(tool_name, tool_input)
+                                            tool_uses.append(formatted)
+
+                                            if on_event:
+                                                await on_event({
+                                                    "type": "tool_use",
+                                                    "tool": tool_name,
+                                                    "input": tool_input,
+                                                    "formatted": formatted
+                                                })
+
+                                        elif block_type == "tool_result":
+                                            if on_event:
+                                                await on_event({
+                                                    "type": "tool_result",
+                                                    "content": str(block.get("content", ""))[:200]
+                                                })
+
+                                        elif block_type == "text":
+                                            text = block.get("text", "")
+                                            if text:
+                                                text_parts.append(text)
+                                                if on_event:
+                                                    await on_event({
+                                                        "type": "text",
+                                                        "text": text
+                                                    })
+
+                                        elif block_type == "thinking":
+                                            thinking = block.get("thinking", "")
+                                            if thinking and len(thinking) > 10:
+                                                if len(thinking) > 200:
+                                                    thinking = thinking[:197] + "..."
+                                                thinking_blocks.append(thinking)
+
+                                                if on_event:
+                                                    await on_event({
+                                                        "type": "thinking",
+                                                        "content": thinking
+                                                    })
+
+                        elif event_type == "result":
+                            # Final result
+                            result_text = event.get("result", "")
+                            if result_text and not text_parts:
+                                text_parts.append(result_text)
+                            new_session_id = event.get("session_id", new_session_id)
+
+                            # Extract server tool usage
+                            usage = event.get("usage", {})
+                            server_tool_use = usage.get("server_tool_use", {})
+                            web_search = server_tool_use.get("web_search_requests", 0)
+                            web_fetch = server_tool_use.get("web_fetch_requests", 0)
+
+                            if web_search > 0:
+                                tool_uses.append(f"🌐 **Web Search** ({web_search} request{'s' if web_search > 1 else ''})")
+                            if web_fetch > 0:
+                                tool_uses.append(f"📄 **Web Fetch** ({web_fetch} request{'s' if web_fetch > 1 else ''})")
+
+                            if on_event:
+                                await on_event({
+                                    "type": "complete",
+                                    "session_id": new_session_id
+                                })
+
+                except json.JSONDecodeError:
+                    logger.debug(f"Non-JSON line: {line_str[:100]}")
+                    continue
+
+            # Wait for process to complete
+            await process.wait()
+
+            # Check for errors
+            if process.returncode != 0:
+                stderr = await process.stderr.read()
+                error_msg = stderr.decode("utf-8", errors="replace") if stderr else "Unknown error"
+                return f"Error running Claude Code (exit code {process.returncode}):\n{error_msg}", [], [], None
+
+            # Build final response
+            final_response = "".join(text_parts)
+            final_response = redact_secrets(final_response.strip()) if final_response else "No output from Claude Code"
+
+            logger.info(f"Streaming complete. Response length: {len(final_response)}, Tools: {len(tool_uses)}")
+
+            return final_response, tool_uses, thinking_blocks, new_session_id
+
+        except asyncio.TimeoutError:
+            if 'process' in locals():
+                process.kill()
+            return "Error: Claude Code timed out after 5 minutes", [], [], None
+        except FileNotFoundError:
+            return "Error: Claude Code CLI not found. Make sure 'claude' is installed and in PATH.", [], [], None
+        except Exception as e:
+            logger.exception(f"Error running Claude Code (streaming): {e}")
+            return f"Error running Claude Code: {str(e)}", [], [], None
+
     def process_message(self, user_id: int, message: str) -> list[tuple[str | None, bytes | None]]:
         """
         Process a user message through Claude Code.
@@ -472,6 +671,77 @@ class Agent:
 
         # Run Claude Code with session continuation
         response, tool_uses, thinking, new_session_id = self._run_claude_code(message, session_id)
+
+        # Store new session ID for future messages
+        if new_session_id:
+            self.session_ids[user_id] = new_session_id
+
+        # Build the formatted response
+        parts = []
+
+        # Add thinking summary if verbose
+        if self.verbose and thinking:
+            parts.append("🧠 **Thinking:**")
+            for thought in thinking[:3]:
+                parts.append(f"_{thought}_")
+            parts.append("")
+
+        # Add tool uses if verbose
+        if self.verbose and tool_uses:
+            parts.append("⚙️ **Actions:**")
+            for tool in tool_uses[:10]:
+                parts.append(f"  • {tool}")
+            if len(tool_uses) > 10:
+                parts.append(f"  _...and {len(tool_uses) - 10} more_")
+            parts.append("")
+
+        # Add separator if we had transparency info
+        if parts:
+            parts.append("───────────────")
+            parts.append("")
+
+        # Add the main response
+        parts.append(response)
+
+        formatted_response = "\n".join(parts)
+
+        # Check for screenshots
+        image_bytes = None
+        image_match = re.search(r'screenshot[s]?\s+saved?\s+(?:to|at)\s+["\']?([^"\'>\s]+)', response or "", re.IGNORECASE)
+        if image_match:
+            image_path = image_match.group(1)
+            try:
+                with open(image_path, "rb") as f:
+                    image_bytes = f.read()
+            except Exception as e:
+                logger.warning(f"Could not read screenshot at {image_path}: {e}")
+
+        return [(formatted_response, image_bytes)]
+
+    async def process_message_streaming(
+        self,
+        user_id: int,
+        message: str,
+        on_event: Callable[[dict], Awaitable[None]] = None
+    ) -> list[tuple[str | None, bytes | None]]:
+        """
+        Process a user message through Claude Code with streaming events.
+
+        Args:
+            user_id: The Telegram user ID (for conversation tracking)
+            message: The user's message
+            on_event: Async callback called for each streaming event
+
+        Returns:
+            List of (text, image_bytes) tuples to send back
+        """
+        # Get existing session ID for this user
+        session_id = self.session_ids.get(user_id)
+
+        # Run Claude Code with streaming
+        response, tool_uses, thinking, new_session_id = await self.run_claude_code_streaming(
+            message, session_id, on_event
+        )
 
         # Store new session ID for future messages
         if new_session_id:
