@@ -13,6 +13,7 @@ from telegram.ext import (
 
 from .agent import Agent
 from .ollama_agent import OllamaAgent
+from .avatar_gui import AvatarWindow, get_state_for_tool
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +28,13 @@ class TelegramBot:
         agent: Agent,
         allowed_user_ids: set[int],
         ollama_agent: OllamaAgent = None,
+        avatar: AvatarWindow = None,
     ):
         self.token = token
         self.agent = agent
         self.ollama_agent = ollama_agent
         self.allowed_user_ids = allowed_user_ids
+        self.avatar = avatar
         self.application = None
         self.ollama_mode_users: set[int] = set()  # Users with Ollama mode enabled
 
@@ -268,6 +271,12 @@ class TelegramBot:
         user_id = update.effective_user.id
         logger.info(f"Ollama mode message from user {user_id}: {message_text[:100]}...")
 
+        # Update avatar to show Ollama is active
+        if self.avatar:
+            self.avatar.set_model(f"Ollama ({self.ollama_agent.model})")
+            self.avatar.set_state("thinking")
+            self.avatar.add_activity(f"> Ollama: {message_text[:30]}...")
+
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action="typing"
@@ -280,6 +289,11 @@ class TelegramBot:
         try:
             response = self.ollama_agent.process_message(user_id, message_text)
             await processing_msg.delete()
+
+            # Update avatar state
+            if self.avatar:
+                self.avatar.set_state("idle")
+                self.avatar.add_activity("--- Complete ---")
 
             # Send response, splitting if too long
             max_length = 4096
@@ -298,6 +312,11 @@ class TelegramBot:
                 pass
             await update.message.reply_text(f"Ollama error:\n{str(e)}")
 
+            # Update avatar on error
+            if self.avatar:
+                self.avatar.set_state("idle")
+                self.avatar.add_activity(f"Error: {str(e)[:30]}")
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages (routes to Claude Code or Ollama based on mode)."""
         user_id = update.effective_user.id
@@ -315,6 +334,10 @@ class TelegramBot:
         if user_id in self.ollama_mode_users and self.ollama_agent:
             await self._handle_ollama_message(update, context, message_text)
             return
+
+        # Update avatar to show Claude is active
+        if self.avatar:
+            self.avatar.set_model("Claude")
 
         logger.info(f"Message from user {user_id}: {message_text[:100]}...")
 
@@ -396,6 +419,14 @@ class TelegramBot:
                 state["tools_list"].append(event.get("formatted", "Unknown"))
                 await update_status_message()
 
+                # Update avatar state based on tool
+                if self.avatar:
+                    tool_name = event.get("tool_name", "")
+                    formatted = event.get("formatted", "")
+                    avatar_state = get_state_for_tool(tool_name)
+                    self.avatar.set_state(avatar_state, formatted)
+                    self.avatar.add_activity(f"> {formatted}")
+
                 # Send typing action to keep indicator alive
                 try:
                     await context.bot.send_chat_action(
@@ -409,9 +440,17 @@ class TelegramBot:
                 state["current_tool"] = None
                 await update_status_message()
 
+                # Update avatar to processing state
+                if self.avatar:
+                    self.avatar.set_state("processing")
+
             elif event_type == "thinking":
                 state["thinking"] = True
                 await update_status_message()
+
+                # Update avatar to thinking state
+                if self.avatar:
+                    self.avatar.set_state("thinking")
 
             elif event_type == "text":
                 state["has_text"] = True
@@ -419,11 +458,20 @@ class TelegramBot:
                 if not state["has_text"]:
                     await update_status_message()
 
+                # Update avatar to speaking state
+                if self.avatar:
+                    self.avatar.set_state("speaking")
+
             elif event_type == "complete":
                 # Final update before completion
                 if state["pending_update"]:
                     state["last_edit"] = 0  # Force update
                     await update_status_message()
+
+                # Return avatar to idle
+                if self.avatar:
+                    self.avatar.set_state("idle")
+                    self.avatar.add_activity("--- Complete ---")
 
         try:
             # Process with streaming

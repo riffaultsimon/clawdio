@@ -5,6 +5,7 @@ from .config import get_config
 from .agent import Agent
 from .ollama_agent import OllamaAgent
 from .telegram_bot import TelegramBot
+from .avatar_gui import AvatarWindow
 
 # Configure logging
 logging.basicConfig(
@@ -41,16 +42,25 @@ def main():
         )
         logger.info(f"Ollama agent initialized (model: {ollama_agent.model})")
 
+        # Initialize and start the avatar GUI
+        avatar = AvatarWindow()
+        avatar.start()
+        logger.info("Avatar GUI started")
+
         # Initialize and run the Telegram bot
         bot = TelegramBot(
             token=config["telegram_token"],
             agent=agent,
             allowed_user_ids=config["allowed_user_ids"],
             ollama_agent=ollama_agent,
+            avatar=avatar,
         )
 
         # Run the bot (this blocks until stopped)
-        bot.run()
+        try:
+            bot.run()
+        finally:
+            avatar.stop()
 
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
